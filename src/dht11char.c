@@ -13,8 +13,9 @@
 #include <linux/device.h>         // Header to support the kernel Driver Model
 #include <linux/kernel.h>         // Contains types, macros, functions for the kernel
 #include <linux/fs.h>             // Header for the Linux file system support
+#include <linux/interrupt.h>      // Required for the IRQ code
 #include <asm/uaccess.h>          // Required for the copy to user function
-#define  DEVICE_NAME "DHT11char"  ///< The device will appear at /dev/ebbchar using this value
+#define  DEVICE_NAME "DHT11char"  ///< The device will appear at /dev/ using this value
 #define  CLASS_NAME  "dht11"      ///< The device class -- this is a character device driver
  
 MODULE_LICENSE("GPL");              ///< The license type -- this affects runtime behavior
@@ -31,12 +32,24 @@ static char   BUFFER_DHT11[256] = {0};         ///< Memory for the string that i
 static struct class*  dht11_charClass  = NULL; ///< The device-driver class struct pointer
 static struct device* dht11_charDevice = NULL; ///< The device-driver device struct pointer
 
+struct Gpios_Driver{
+    int ID;
+    char *Name;
+    irq_handler_t (*IrqFunction)(unsigned int irq, void *dev_id, struct pt_regs *regs); 
+    unsigned long IrqFlags;
+    char *IrqHandlerName;
+};
+
+
 // The prototype functions for the character driver -- must come before the struct definition
 static int     dev_open(struct inode *, struct file *);
 static int     dev_release(struct inode *, struct file *);
 static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
 //static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
 
+static bool InitGpio(struct Gpios_Driver*);
+static irq_handler_t photogpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs);
+static irq_handler_t raingpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs);
 /** @brief Devices are represented as file structure in the kernel. The file_operations structure from
  *  /linux/fs.h lists the callback functions that you wish to associated with your file operations
  *  using a C99 syntax structure. char devices usually implement open, read, write and release calls
@@ -59,7 +72,14 @@ static struct file_operations fops =
    .release = dev_release,
 };
 
-//Gpio
+static struct Gpios_Driver Gpios[]={
+    {.ID=4,.Name ="Dht11", .IrqFunction = NULL},
+    {.ID=5,.Name ="PhotoSensor", .IrqFunction = photogpio_irq_handler,
+    .IrqFlags = IRQF_TRIGGER_RISING, .IrqHandlerName = "PhotoSensor_irq"},
+    {.ID=6,.Name ="RainSensor", .IrqFunction = raingpio_irq_handler, 
+    .IrqFlags = IRQF_TRIGGER_RISING, .IrqHandlerName = "RainSensor_irq"}
+};
+
 static unsigned int gpioDHT11 = 4;       ///< hard coding the LED gpio for this example to P9_23 (GPIO49)
 
 //Wait Queue
@@ -77,7 +97,7 @@ static DEFINE_MUTEX(dht11_device_mutex);
 */
  
 static int __init DHT11_Char_init(void){
-   int retvalue =0;
+   int retvalue =0,i=0;
    printk(KERN_INFO "DHT11_Char: Initializing %s LKM!\n", name);
    
    // Try to dynamically allocate a major number for the device -- more difficult but worth it
@@ -106,25 +126,13 @@ static int __init DHT11_Char_init(void){
       goto device_error;
    }
 
-   // Verify if gpioNumber is valid
-   if (!gpio_is_valid(gpioDHT11)){
-      printk(KERN_INFO "DHT11_Char: invalid GPIO %d\n", gpioDHT11);
-      retvalue =-ENODEV;
-      goto device_error;
-   }
-
-   // gpioLED is hardcoded to 49, request it
-   // Return zero if ok
-   // Label is showed in /sys/kernel/debug/gpio
-   if(gpio_request(gpioDHT11, "DHT11") != 0){
-       printk(KERN_INFO "DHT11_Char: request fail GPIO %d\n",gpioDHT11);
-       retvalue= -ENODEV;
-       goto device_error;
-   }
-
-   gpio_direction_input(gpioDHT11);            // Set the button GPIO to be an input
-
-   gpio_export(gpioDHT11, true);               // Causes gpio115 to appear in /sys/class/gpio          
+   i=0;
+   do{
+        if(!InitGpio(&Gpios[i])){
+            retvalue =-ENODEV;
+            goto device_error;
+        }
+   }while(i < sizeof(Gpios)/sizeof(struct Gpios_Driver));
 
    printk(KERN_INFO "DHT11_Char: device class created correctly\n"); // Made it! device was initialized
    return retvalue;  
@@ -136,6 +144,44 @@ class_error:
     return retvalue;
 }
 
+
+static bool InitGpio(struct Gpios_Driver* Gpio){
+    bool sucesso = true;
+    int irqNumber,result;
+    // Verify if gpioNumber is valid
+   if (!gpio_is_valid(Gpio->ID)){
+      printk(KERN_INFO "DHT11_Char: invalid GPIO %d\n", gpioDHT11);
+      sucesso=false;
+   }else{
+        // Gpio hardcoded, request it
+        // Return zero if ok
+        // Label is showed in /sys/kernel/debug/gpio
+        if(gpio_request(Gpio->ID, Gpio->Name) != 0){
+            printk(KERN_INFO "DHT11_Char: request fail GPIO %d\n",gpioDHT11);
+            sucesso =false;
+        }else{
+            gpio_direction_input(Gpio->ID);            // Set the button GPIO to be an input
+            gpio_export(Gpio->ID, true);               // Causes to appear in /sys/class/gpio 
+            // GPIO numbers and IRQ numbers are not the same! This function performs the mapping for us
+            if(Gpio->IrqFunction != NULL){
+                irqNumber = gpio_to_irq(Gpio->ID);
+                result = request_irq(irqNumber,             // The interrupt number requested
+                        (irq_handler_t) Gpio->IrqFunction,  // The pointer to the handler function below
+                        Gpio->IrqFlags,                    // Interrupt on rising edge (button press, not release)
+                        Gpio->IrqHandlerName,               // Used in /proc/interrupts to identify the owner
+                        NULL);                              // The *dev_id for shared interrupt lines, NULL is okay
+
+                if(result != 0){
+                    printk(KERN_INFO "DHT11_Char: Gpio %d IrqRequestFail %d\n",Gpio->ID,result);
+                    sucesso = false;
+                }        
+            }
+            
+        }
+   }
+  
+   return sucesso;
+}
 
 /** @brief The Wait Start Bit Function
  *  Start Bit is sended for DHT11 before every bit value. This function wait e dettect
@@ -153,11 +199,10 @@ static int read_start_bit(en_Mode Mode){
         switch(state){
             
             case 0:
-
             if(gpio_get_value(gpioDHT11)==0){
                  state +=2;
             }  
-            else
+          else
                 state =1;
             break;
             case 1:
@@ -471,6 +516,17 @@ static int dev_release(struct inode *inodep, struct file *filep){
     printk(KERN_INFO "DHT11_Char: Device successfully closed\n");
     return 0;
 }
+
+
+static irq_handler_t photogpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs) { 
+   // the actions that the interrupt should perform
+   return NULL;
+}
+static irq_handler_t raingpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs) { 
+   // the actions that the interrupt should perform
+   return NULL;
+}
+
 
 
  

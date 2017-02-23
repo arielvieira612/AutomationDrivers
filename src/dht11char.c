@@ -6,6 +6,7 @@
  * @brief  Driver responsável por ler sensor DHT11.
 */
 #include <linux/delay.h>
+#include <linux/cdev.h>
 #include <linux/sched.h>          // Required for jiffies functions (timers)
 #include <linux/gpio.h>           // Required for the GPIO functions
 #include <linux/init.h>           // Macros used to mark up functions e.g. __init __exit
@@ -32,13 +33,39 @@ static char   BUFFER_DHT11[256] = {0};         ///< Memory for the string that i
 static struct class*  dht11_charClass  = NULL; ///< The device-driver class struct pointer
 static struct device* dht11_charDevice = NULL; ///< The device-driver device struct pointer
 
-struct Gpios_Driver{
-    int ID;
-    char *Name;
-    irq_handler_t (*IrqFunction)(unsigned int irq, void *dev_id, struct pt_regs *regs); 
-    unsigned long IrqFlags;
-    char *IrqHandlerName;
+enum state {low, high};
+enum direction{in, out};
+
+struct Gpios_Driver {
+    struct cdev cdev;
+    struct gpio *pin;
+    enum state state;
+    enum direction dir;
+    bool irq_perm;
+    unsigned long irq_flag;
+    unsigned int irq_counter;
+    spinlock_t lock;
 };
+
+static const int NUM_GPIO_PINS = 3;
+
+#define GPIO_NUM_DHT11  4
+#define GPIO_NUM_PHOTO  5
+#define GPIO_NUM_RAIN   6
+
+static struct gpio GpioDht11={.gpio = GPIO_NUM_DHT11, .flags = GPIOF_IN, .label = "At_Dht11_Gpio"};
+static struct gpio GpioPhoto={.gpio = GPIO_NUM_PHOTO, .flags = GPIOF_IN, .label = "At_Photo_Gpio"};
+static struct gpio GpioRain={.gpio = GPIO_NUM_RAIN, .flags = GPIOF_IN, .label = "At_Rain_Gpio"};
+
+static struct Gpios_Driver Gpios[]={
+    {.pin=&GpioDht11},
+    {.pin=&GpioPhoto},
+    {.pin=&GpioRain}
+};
+
+//This Structs Holds Device Driver Number. Point to First Allocated. 
+// This Device has 1 Major Number and NUMGPIO Minor Number, 
+static dev_t first;
 
 
 // The prototype functions for the character driver -- must come before the struct definition
@@ -47,9 +74,6 @@ static int     dev_release(struct inode *, struct file *);
 static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
 //static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
 
-static bool InitGpio(struct Gpios_Driver*);
-static irq_handler_t photogpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs);
-static irq_handler_t raingpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs);
 /** @brief Devices are represented as file structure in the kernel. The file_operations structure from
  *  /linux/fs.h lists the callback functions that you wish to associated with your file operations
  *  using a C99 syntax structure. char devices usually implement open, read, write and release calls
@@ -72,13 +96,15 @@ static struct file_operations fops =
    .release = dev_release,
 };
 
-static struct Gpios_Driver Gpios[]={
+/*static struct Gpios_Driver Gpios[]={
     {.ID=4,.Name ="Dht11", .IrqFunction = NULL},
     {.ID=5,.Name ="PhotoSensor", .IrqFunction = photogpio_irq_handler,
     .IrqFlags = IRQF_TRIGGER_RISING, .IrqHandlerName = "PhotoSensor_irq"},
     {.ID=6,.Name ="RainSensor", .IrqFunction = raingpio_irq_handler, 
     .IrqFlags = IRQF_TRIGGER_RISING, .IrqHandlerName = "RainSensor_irq"}
-};
+};*/
+
+
 
 static unsigned int gpioDHT11 = 4;       ///< hard coding the LED gpio for this example to P9_23 (GPIO49)
 
@@ -97,16 +123,14 @@ static DEFINE_MUTEX(dht11_device_mutex);
 */
  
 static int __init DHT11_Char_init(void){
-   int retvalue =0,i=0;
+   int retvalue =0,i=0, index=0;
    printk(KERN_INFO "DHT11_Char: Initializing %s LKM!\n", name);
    
-   // Try to dynamically allocate a major number for the device -- more difficult but worth it
-   majorNumber = register_chrdev(0, DEVICE_NAME, &fops);
-   
-   if (majorNumber<0){
-      printk(KERN_ALERT "DHT11_Char: failed to register a major number\n");
-      return majorNumber;
+   if (alloc_chrdev_region(&first,0,NUM_GPIO_PINS,DEVICE_NAME) < 0) {
+        printk(KERN_DEBUG "Cannot register device\n");
+        return -1;
    }
+
    printk(KERN_INFO "DHT11_Char: registered correctly with major number %d\n", majorNumber);
  
    // Register the device class
@@ -121,18 +145,38 @@ static int __init DHT11_Char_init(void){
    // Register the device driver
    dht11_charDevice = device_create(dht11_charClass, NULL, MKDEV(majorNumber, 0), NULL, DEVICE_NAME);
    if (IS_ERR(dht11_charDevice)){                   // Clean up if there is an error
-      printk(KERN_ALERT "Failed to create the device\n");
+      printk(KERN_ALERT "DHT11_Char:Failed to create the device\n");
       retvalue= PTR_ERR(dht11_charDevice);
       goto device_error;
    }
 
-   i=0;
-   do{
-        if(!InitGpio(&Gpios[i])){
-            retvalue =-ENODEV;
+    for (i = 0; i < NUM_GPIO_PINS; i++) {
+        if (gpio_request_one(Gpios[index].pin->gpio, Gpios[index].pin->flags, Gpios[index].pin->label) < 0) {
+            printk(KERN_ALERT "DHT11_Char:Error requesting GPIO %d\n", i);
+            return -ENODEV;
+        }
+        Gpios[index].dir = in;
+        Gpios[index].state = low;
+        Gpios[index].cdev.owner = THIS_MODULE;
+        spin_lock_init(&Gpios[index].lock);
+        cdev_init(&Gpios[index].cdev, &fops);
+        gpio_export(Gpios[index].pin->gpio,true);
+        if ((retvalue = cdev_add(&Gpios[index].cdev,(first + i),1))) {
+            printk (KERN_ALERT "DHT11_Char:Error %d adding cdev\n", retvalue);
+            for (i = 0; i < NUM_GPIO_PINS; i++){ 
+                device_destroy (dht11_charClass, MKDEV(MAJOR(first), MINOR(first) + i));
+            }
             goto device_error;
         }
-   }while(i < sizeof(Gpios)/sizeof(struct Gpios_Driver));
+
+        if (device_create(dht11_charClass, NULL, MKDEV(MAJOR(first), MINOR(first)+i),
+            NULL,Gpios[index].pin->label, Gpios[index].pin->gpio) == NULL) {
+            retvalue = -1;
+            goto device_error;
+        }
+        
+        index++;
+    }
 
    printk(KERN_INFO "DHT11_Char: device class created correctly\n"); // Made it! device was initialized
    return retvalue;  
@@ -140,48 +184,11 @@ static int __init DHT11_Char_init(void){
 device_error:
     class_destroy(dht11_charClass);               // Repeated code but the alternative is goto statements
 class_error:
-    unregister_chrdev(majorNumber, DEVICE_NAME);
+   // unregister_chrdev(majorNumber, DEVICE_NAME);
+    unregister_chrdev_region(first, NUM_GPIO_PINS);
     return retvalue;
 }
 
-
-static bool InitGpio(struct Gpios_Driver* Gpio){
-    bool sucesso = true;
-    int irqNumber,result;
-    // Verify if gpioNumber is valid
-   if (!gpio_is_valid(Gpio->ID)){
-      printk(KERN_INFO "DHT11_Char: invalid GPIO %d\n", gpioDHT11);
-      sucesso=false;
-   }else{
-        // Gpio hardcoded, request it
-        // Return zero if ok
-        // Label is showed in /sys/kernel/debug/gpio
-        if(gpio_request(Gpio->ID, Gpio->Name) != 0){
-            printk(KERN_INFO "DHT11_Char: request fail GPIO %d\n",gpioDHT11);
-            sucesso =false;
-        }else{
-            gpio_direction_input(Gpio->ID);            // Set the button GPIO to be an input
-            gpio_export(Gpio->ID, true);               // Causes to appear in /sys/class/gpio 
-            // GPIO numbers and IRQ numbers are not the same! This function performs the mapping for us
-            if(Gpio->IrqFunction != NULL){
-                irqNumber = gpio_to_irq(Gpio->ID);
-                result = request_irq(irqNumber,             // The interrupt number requested
-                        (irq_handler_t) Gpio->IrqFunction,  // The pointer to the handler function below
-                        Gpio->IrqFlags,                    // Interrupt on rising edge (button press, not release)
-                        Gpio->IrqHandlerName,               // Used in /proc/interrupts to identify the owner
-                        NULL);                              // The *dev_id for shared interrupt lines, NULL is okay
-
-                if(result != 0){
-                    printk(KERN_INFO "DHT11_Char: Gpio %d IrqRequestFail %d\n",Gpio->ID,result);
-                    sucesso = false;
-                }        
-            }
-            
-        }
-   }
-  
-   return sucesso;
-}
 
 /** @brief The Wait Start Bit Function
  *  Start Bit is sended for DHT11 before every bit value. This function wait e dettect
@@ -442,12 +449,17 @@ static int read_sensor(void){
  *  code is used for a built-in driver (not a LKM) that this function is not required.
  */
 static void __exit DHT11_Char_exit(void){
-   gpio_unexport(gpioDHT11);                                    // remove from sysfs
-   gpio_free(gpioDHT11);                                       // deallocate the GPIO line
+   int i;
    device_destroy(dht11_charClass, MKDEV(majorNumber, 0));      // remove the device
+   unregister_chrdev_region(first, NUM_GPIO_PINS);
+
+   for (i= 0; i < NUM_GPIO_PINS; i++){
+            device_destroy (dht11_charClass,MKDEV(MAJOR(first),MINOR(first) + i));
+            gpio_free(Gpios[i].pin->gpio);
+    }
+   
    class_unregister(dht11_charClass);                           // unregister the device class
    class_destroy(dht11_charClass);                              // remove the device class
-   unregister_chrdev(majorNumber, DEVICE_NAME);                 // unregister the major number
    printk(KERN_INFO "DHT11_Char: Finished %s from the BBB LKM!\n", name);
 }
 
@@ -457,8 +469,8 @@ static void __exit DHT11_Char_exit(void){
  *  @param filep A pointer to a file object (defined in linux/fs.h)
  */
 static int dev_open(struct inode *inodep, struct file *filep){
+   struct Gpios_Driver *driver_devp;
    printk(KERN_INFO "DHT11_Char: Device has been opened time(s)\n");
-
     /* This Device does not allow write access */
     if ( ((filep->f_flags & O_ACCMODE) == O_WRONLY)
     || ((filep->f_flags & O_ACCMODE) == O_RDWR) ) {
@@ -469,7 +481,13 @@ static int dev_open(struct inode *inodep, struct file *filep){
     if (!mutex_trylock(&dht11_device_mutex)) {
         printk(KERN_INFO "DHT11_Char: another process is accessing the device\n");
         return -EBUSY;
+    }else{
+        driver_devp = container_of(inodep->i_cdev, struct Gpios_Driver, cdev);
+        filep->private_data = driver_devp;
+        return 0;
     }
+
+
 
     mutex_unlock(&dht11_device_mutex);
     return 0;
@@ -483,13 +501,37 @@ static int dev_open(struct inode *inodep, struct file *filep){
  *  @param len The length of the b
  *  @param offset The offset if required
  */
+
 static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset){
-   int error_count = 0;
-   error_count = read_sensor();
-   if(error_count == 0){
-       error_count = copy_to_user(buffer, BUFFER_DHT11, 5);
+   struct Gpios_Driver *driver_devp;
+   int error_count = 0, sizeMessage=0;
+   char BufferPin[2];
+   driver_devp = filep->private_data;
+
+   printk(KERN_INFO "DHT11_Char: Read Function Gpio %d lengh %d", driver_devp->pin->gpio, len);
+
+   switch(driver_devp->pin->gpio){
+       case GPIO_NUM_DHT11:
+           error_count = read_sensor();
+           if(error_count == 0){
+                error_count = copy_to_user(buffer, BUFFER_DHT11, 5);
+           }
+           sizeMessage=5;
+       break;
+       case GPIO_NUM_RAIN:
+       case GPIO_NUM_PHOTO:
+            sizeMessage=2;
+            BufferPin[0]= '0' + gpio_get_value(driver_devp->pin->gpio); 
+            BufferPin[1] = 0;
+            error_count = copy_to_user(buffer, BufferPin, 1); 
+            printk(KERN_INFO "DHT11_Char: buffteste %s ", BufferPin);     
+       break;
+       default:
+            printk(KERN_INFO "DHT11_Char: Invalid Gpio %d ", driver_devp->pin->gpio);
+       break;
    }
-   return error_count;
+
+   return sizeMessage;
    
 }
  
@@ -516,19 +558,6 @@ static int dev_release(struct inode *inodep, struct file *filep){
     printk(KERN_INFO "DHT11_Char: Device successfully closed\n");
     return 0;
 }
-
-
-static irq_handler_t photogpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs) { 
-   // the actions that the interrupt should perform
-   return NULL;
-}
-static irq_handler_t raingpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs) { 
-   // the actions that the interrupt should perform
-   return NULL;
-}
-
-
-
  
 /** @brief A module must use the module_init() module_exit() macros from linux/init.h, which
  *  identify the initialization function at insertion time and the cleanup function (as
